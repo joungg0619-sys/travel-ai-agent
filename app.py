@@ -23,6 +23,16 @@ def get_secret(name):
         return None
 
 
+def mask_secret(value):
+    if not value:
+        return "없음"
+
+    if len(value) <= 8:
+        return "설정됨"
+
+    return value[:4] + "..." + value[-4:]
+
+
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 NAVER_CLIENT_ID = get_secret("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = get_secret("NAVER_CLIENT_SECRET")
@@ -88,53 +98,94 @@ def make_naver_place_link(place):
     return make_naver_map_search_link(query)
 
 
-def search_naver_local(query, display=5):
+def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
     if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
-        return []
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET이 설정되어 있지 않습니다.",
+            "data": None,
+            "text": ""
+        }
 
     url = "https://openapi.naver.com/v1/search/local.json"
 
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        "Accept": "application/json"
     }
 
     params = {
         "query": query,
-        "display": min(display, 5)
+        "display": min(display, 5),
+        "start": start,
+        "sort": sort
     }
 
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=10
+        )
 
-        if res.status_code != 200:
-            return []
+        try:
+            data = res.json()
+        except Exception:
+            data = None
 
-        data = res.json()
-        items = data.get("items", [])
+        return {
+            "ok": res.status_code == 200,
+            "status_code": res.status_code,
+            "error": None if res.status_code == 200 else res.text,
+            "data": data,
+            "text": res.text
+        }
 
-        results = []
+    except Exception as e:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(e),
+            "data": None,
+            "text": ""
+        }
 
-        for item in items:
-            title = clean_html(item.get("title", ""))
-            category = clean_html(item.get("category", ""))
-            address = clean_html(item.get("address", ""))
-            road_address = clean_html(item.get("roadAddress", ""))
 
-            if not title:
-                continue
+def search_naver_local(query, display=5):
+    raw = fetch_naver_local_raw(query, display=display)
 
-            results.append({
-                "title": title,
-                "category": category,
-                "address": address,
-                "road_address": road_address
-            })
+    if not raw["ok"]:
+        return [], raw
 
-        return results
+    data = raw["data"] or {}
+    items = data.get("items", [])
 
-    except Exception:
-        return []
+    results = []
+
+    for item in items:
+        title = clean_html(item.get("title", ""))
+        category = clean_html(item.get("category", ""))
+        address = clean_html(item.get("address", ""))
+        road_address = clean_html(item.get("roadAddress", ""))
+        mapx = item.get("mapx", "")
+        mapy = item.get("mapy", "")
+
+        if not title:
+            continue
+
+        results.append({
+            "title": title,
+            "category": category,
+            "address": address,
+            "road_address": road_address,
+            "mapx": mapx,
+            "mapy": mapy
+        })
+
+    return results, raw
 
 
 def address_matches_region(place, broad_region):
@@ -142,7 +193,6 @@ def address_matches_region(place, broad_region):
         return True
 
     address_text = f"{place.get('address', '')} {place.get('road_address', '')}"
-
     aliases = REGION_ALIASES.get(broad_region, [broad_region])
 
     return any(alias in address_text for alias in aliases)
@@ -332,21 +382,39 @@ def build_search_queries(destination, preference):
     return queries
 
 
-def get_verified_place_candidates(destination, preference):
+def get_verified_place_candidates(destination, preference, use_region_filter=True):
     broad_region = extract_broad_region(destination)
-
     queries = build_search_queries(destination, preference)
 
     candidates = []
     seen = set()
+    diagnostics = []
 
     for query in queries:
-        results = search_naver_local(query, display=5)
+        raw_results, raw_response = search_naver_local(query, display=5)
 
-        for place in results:
-            if not address_matches_region(place, broad_region):
-                continue
+        before_count = len(raw_results)
 
+        if use_region_filter:
+            filtered_results = [
+                place for place in raw_results
+                if address_matches_region(place, broad_region)
+            ]
+        else:
+            filtered_results = raw_results
+
+        after_count = len(filtered_results)
+
+        diagnostics.append({
+            "query": query,
+            "status_code": raw_response.get("status_code"),
+            "ok": raw_response.get("ok"),
+            "before_filter": before_count,
+            "after_filter": after_count,
+            "error": raw_response.get("error")
+        })
+
+        for place in filtered_results:
             key = f"{place['title']}|{place.get('road_address') or place.get('address')}"
 
             if key in seen:
@@ -355,12 +423,11 @@ def get_verified_place_candidates(destination, preference):
             seen.add(key)
 
             place_id = f"P{len(candidates) + 1:03d}"
-
             place["id"] = place_id
             place["map_link"] = make_naver_place_link(place)
             candidates.append(place)
 
-    return candidates[:30]
+    return candidates[:30], diagnostics
 
 
 def format_candidates_for_prompt(candidates):
@@ -384,12 +451,64 @@ def get_candidate_by_id(candidates, place_id):
     return None
 
 
-def render_verified_candidates(candidates):
+def render_naver_api_debug(destination):
+    st.subheader("네이버 API 진단 모드")
+
+    st.write("이 영역은 네이버 지역 검색 API가 Streamlit 서버에서 정상 작동하는지 확인하기 위한 진단 기능입니다.")
+
+    st.write(f"OPENAI_API_KEY: {mask_secret(OPENAI_API_KEY)}")
+    st.write(f"NAVER_CLIENT_ID: {mask_secret(NAVER_CLIENT_ID)}")
+    st.write(f"NAVER_CLIENT_SECRET: {mask_secret(NAVER_CLIENT_SECRET)}")
+
+    test_query = st.text_input(
+        "네이버 API 테스트 검색어",
+        value=destination if destination else "진주"
+    )
+
+    if st.button("네이버 API 연결 테스트"):
+        raw = fetch_naver_local_raw(test_query, display=5)
+
+        st.write(f"요청 URL: https://openapi.naver.com/v1/search/local.json")
+        st.write(f"검색어: {test_query}")
+        st.write(f"상태 코드: {raw.get('status_code')}")
+
+        if raw["ok"]:
+            st.success("네이버 지역 검색 API 호출 성공")
+
+            data = raw["data"] or {}
+            items = data.get("items", [])
+
+            st.write(f"검색 결과 개수: {len(items)}개")
+            st.json(data)
+        else:
+            st.error("네이버 지역 검색 API 호출 실패")
+
+            error_text = raw.get("error") or raw.get("text") or "오류 내용 없음"
+            st.write(error_text)
+
+            st.info(
+                "401이면 Client ID/Secret 문제일 가능성이 높고, "
+                "403이면 해당 애플리케이션에 검색 API 권한이 없을 가능성이 높습니다."
+            )
+
+
+def render_verified_candidates(candidates, diagnostics, used_relaxed_filter):
     st.subheader("검증된 네이버 지역 장소 후보")
-    st.write("아래 후보는 네이버 지역 검색 API 결과를 지역 기준으로 필터링한 목록입니다.")
+
+    if used_relaxed_filter:
+        st.warning(
+            "엄격한 지역 필터 적용 시 후보가 없어, 지역 필터를 완화해서 후보를 가져왔습니다. "
+            "결과가 넓은 지역 기준으로 나올 수 있습니다."
+        )
+    else:
+        st.write("아래 후보는 네이버 지역 검색 API 결과를 지역 기준으로 필터링한 목록입니다.")
+
+    with st.expander("네이버 검색 진단 결과 보기"):
+        st.write("각 검색어별 API 호출 결과와 필터링 전후 후보 개수입니다.")
+        st.json(diagnostics)
 
     if not candidates:
-        st.warning("검증된 장소 후보가 없습니다. 여행지를 더 넓은 지역명으로 입력해 보세요. 예: 서울 명동, 부산 해운대")
+        st.warning("검증된 장소 후보가 없습니다. 네이버 API 진단 모드에서 상태 코드를 확인해 주세요.")
         return
 
     cols = st.columns(2)
@@ -402,7 +521,7 @@ def render_verified_candidates(candidates):
             st.link_button("네이버지도에서 보기", place["map_link"])
 
 
-def render_travel_plan(plan_data, destination, candidates):
+def render_travel_plan(plan_data, candidates):
     st.markdown("## 전체 여행 요약")
     st.write(plan_data.get("summary", ""))
 
@@ -415,7 +534,6 @@ def render_travel_plan(plan_data, destination, candidates):
     st.markdown("## 날짜별 일정")
 
     daily_schedule = plan_data.get("daily_schedule", [])
-
     used_place_ids = []
 
     for day in daily_schedule:
@@ -446,6 +564,7 @@ def render_travel_plan(plan_data, destination, candidates):
                     f"- **{time_text}**: {description} "
                     f"`예상 비용: {cost}`"
                 )
+
                 if place_id:
                     st.caption(f"검증되지 않은 장소 ID가 제외되었습니다: {place_id}")
 
@@ -453,23 +572,19 @@ def render_travel_plan(plan_data, destination, candidates):
     st.write(plan_data.get("estimated_budget_detail", ""))
 
     st.markdown("## 추천 음식")
-    foods = plan_data.get("recommended_foods", [])
-    for food in foods:
+    for food in plan_data.get("recommended_foods", []):
         st.markdown(f"- {food}")
 
     st.markdown("## 준비물")
-    packing_list = plan_data.get("packing_list", [])
-    for item in packing_list:
+    for item in plan_data.get("packing_list", []):
         st.markdown(f"- {item}")
 
     st.markdown("## 비 올 때 대체 일정")
-    rainy_items = plan_data.get("rainy_day_alternatives", [])
-    for item in rainy_items:
+    for item in plan_data.get("rainy_day_alternatives", []):
         st.markdown(f"- {item}")
 
     st.markdown("## 절약 팁")
-    saving_tips = plan_data.get("saving_tips", [])
-    for tip in saving_tips:
+    for tip in plan_data.get("saving_tips", []):
         st.markdown(f"- {tip}")
 
     recommended_place_ids = plan_data.get("recommended_place_ids", [])
@@ -504,7 +619,7 @@ def render_travel_plan(plan_data, destination, candidates):
 st.title("여행 계획 AI Agent")
 st.write("여행 조건을 입력하면 AI가 날씨, 예산, 네이버 지역 검색 결과를 검증해 맞춤형 여행 일정을 생성합니다.")
 
-destination = st.text_input("여행지", placeholder="예: 서울 명동, 부산 해운대, 제주 서귀포")
+destination = st.text_input("여행지", placeholder="예: 서울 명동, 부산 해운대, 진주")
 
 today = date.today()
 default_start = today
@@ -532,7 +647,7 @@ else:
     st.info("여행 시작일과 종료일을 모두 선택해 주세요.")
 
 budget = st.text_input("예산", placeholder="예: 35만원, 500000원")
-preference = st.text_input("여행 취향", placeholder="예: 맛집, 바다, 자연, 카페")
+preference = st.text_input("여행 취향", placeholder="예: 맛집, 카페, 관광지")
 
 st.subheader("빠른 네이버지도 검색")
 
@@ -559,12 +674,15 @@ if destination:
 else:
     st.info("여행지를 입력하면 네이버지도 검색 버튼이 표시됩니다.")
 
+with st.expander("네이버 API 진단 모드 열기"):
+    render_naver_api_debug(destination)
+
 
 if st.button("여행 계획 생성"):
     if not OPENAI_API_KEY:
         st.error("OPENAI_API_KEY가 설정되어 있지 않습니다. Streamlit Secrets 또는 .env 파일을 확인해 주세요.")
     elif not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
-        st.error("NAVER_CLIENT_ID와 NAVER_CLIENT_SECRET이 필요합니다. 장소 검증 기능을 위해 Streamlit Secrets에 네이버 API 키를 추가해 주세요.")
+        st.error("NAVER_CLIENT_ID와 NAVER_CLIENT_SECRET이 필요합니다. Streamlit Secrets를 확인해 주세요.")
     elif not destination:
         st.warning("여행지를 입력해 주세요.")
     elif not budget:
@@ -582,7 +700,32 @@ if st.button("여행 계획 생성"):
         else:
             weather_info = get_weather(destination, start_date, end_date)
             price_guide = get_korea_price_guide()
-            candidates = get_verified_place_candidates(destination, preference)
+
+            strict_candidates, strict_diagnostics = get_verified_place_candidates(
+                destination,
+                preference,
+                use_region_filter=True
+            )
+
+            used_relaxed_filter = False
+            candidates = strict_candidates
+            diagnostics = strict_diagnostics
+
+            if not strict_candidates:
+                relaxed_candidates, relaxed_diagnostics = get_verified_place_candidates(
+                    destination,
+                    preference,
+                    use_region_filter=False
+                )
+
+                if relaxed_candidates:
+                    candidates = relaxed_candidates
+                    diagnostics = {
+                        "strict_filter": strict_diagnostics,
+                        "relaxed_filter": relaxed_diagnostics
+                    }
+                    used_relaxed_filter = True
+
             candidates_text = format_candidates_for_prompt(candidates)
 
             st.subheader("여행지 날씨 정보")
@@ -608,7 +751,7 @@ if st.button("여행 계획 생성"):
             with st.expander("한국 물가 보정 기준 보기"):
                 st.text(price_guide)
 
-            render_verified_candidates(candidates)
+            render_verified_candidates(candidates, diagnostics, used_relaxed_filter)
 
             if not candidates:
                 st.stop()
@@ -647,11 +790,10 @@ if st.button("여행 계획 생성"):
             - 장소는 반드시 위의 검증된 후보 목록에 있는 place_id만 사용해.
             - 새로운 장소명, 임의 업체명, 과거에 있었던 브랜드명, 존재 여부가 불확실한 장소명은 절대 만들지 마.
             - place_id는 반드시 P001, P002 같은 형식으로 후보 목록에 존재하는 값만 사용해.
-            - 후보 목록에 없는 장소가 필요하면, 장소명을 새로 만들지 말고 description에 “후보 목록 내 대체 장소 사용”이라고 설명해.
             - recommended_place_ids도 반드시 후보 목록의 place_id만 사용해.
-            - 예술의전당처럼 여행지와 다른 구역의 장소는 후보에 없으면 사용하지 마.
-            - 노고단처럼 여행지와 공간적으로 맞지 않는 장소는 사용하지 마.
-            - Mango Six, 노고단처럼 실제 검증되지 않은 장소명은 절대 생성하지 마.
+            - 후보 목록에 없는 장소는 절대 사용하지 마.
+            - 음식 가격을 지나치게 낮게 잡지 마.
+            - 한국 물가 보정 기준을 반드시 반영해.
 
             반드시 아래 JSON 형식으로만 답변해줘.
             마크다운 문법은 사용하지 말고, JSON 이외의 설명도 쓰지 마.
@@ -689,8 +831,6 @@ if st.button("여행 계획 생성"):
             - 강수확률이 높은 날은 실내 관광지, 카페, 박물관, 쇼핑몰 위주로 추천해줘.
             - 날씨가 좋은 날은 야외 관광지, 자연 경관, 산책 코스를 추천해줘.
             - 예산을 초과하지 않도록 현실적인 일정으로 구성해줘.
-            - 한국 물가 보정 기준을 반드시 반영해줘.
-            - 음식 가격을 지나치게 낮게 잡지 마.
             - 이동 동선이 너무 복잡하지 않게 구성해줘.
             """
 
@@ -714,7 +854,7 @@ if st.button("여행 계획 생성"):
                     result = response.choices[0].message.content
                     plan_data = json.loads(result)
 
-                    render_travel_plan(plan_data, destination, candidates)
+                    render_travel_plan(plan_data, candidates)
 
                     st.subheader("추가 네이버지도 검색")
                     col4, col5, col6 = st.columns(3)
