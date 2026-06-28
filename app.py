@@ -958,7 +958,7 @@ def render_metric_card(label, value, caption=""):
     )
 
 
-def render_travel_plan(plan_data, candidates, budget_plan, destination):
+def render_travel_plan(plan_data, candidates, budget_plan, destination, result=None):
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("## 전체 여행 요약")
     st.write(plan_data.get("summary", ""))
@@ -1021,6 +1021,10 @@ def render_travel_plan(plan_data, candidates, budget_plan, destination):
                 render_day_route_links(day, candidates, destination)
 
     render_extra_place_recommendations(plan_data, candidates)
+
+    if result is not None:
+        st.divider()
+        render_schedule_editor(result)
 
     render_budget_breakdown_cards(budget_plan)
 
@@ -1225,14 +1229,6 @@ def build_travel_pdf(
 
     story.append(pdf_paragraph("7. 예상 상세 예산", h1_style))
     story.append(pdf_paragraph(plan_data.get("estimated_budget_detail", ""), body_style))
-
-    story.append(pdf_paragraph("8. 추천 음식", h1_style))
-    for food in plan_data.get("recommended_foods", []):
-        story.append(pdf_paragraph(f"- {food}", body_style))
-
-    story.append(pdf_paragraph("9. 비 올 때 대체 일정", h1_style))
-    for item in plan_data.get("rainy_day_alternatives", []):
-        story.append(pdf_paragraph(f"- {item}", body_style))
 
     doc.build(story)
 
@@ -1820,11 +1816,10 @@ else:
     if edit_success_message:
         st.success(edit_success_message)
 
-    render_schedule_editor(result)
-
     render_travel_plan(
         result["plan_data"],
         result["candidates"],
         result["budget_plan"],
         result["destination"],
+        result,
     )
