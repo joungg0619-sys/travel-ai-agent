@@ -743,6 +743,74 @@ def get_used_place_ids(plan_data):
     return used_place_ids
 
 
+
+def make_route_search_link(start_place, end_place, destination):
+    """
+    네이버지도에서 두 장소 사이의 동선을 확인하기 위한 검색 링크를 만든다.
+    네이버지도 URL 경유지 API를 직접 쓰지 않고, 검색어 기반으로 안정적으로 연결한다.
+    """
+    start_name = start_place.get("title", "").strip()
+    end_name = end_place.get("title", "").strip()
+    location_keyword = get_location_keyword(destination)
+
+    if location_keyword:
+        query = f"{start_name}에서 {end_name} 가는 길 {location_keyword}"
+    else:
+        query = f"{start_name}에서 {end_name} 가는 길"
+
+    return make_naver_map_search_link(query)
+
+
+def get_day_places(day, candidates):
+    """
+    하루 일정에 포함된 place_id를 실제 후보 장소 정보로 변환한다.
+    같은 장소가 연속으로 반복되면 한 번만 남긴다.
+    """
+    places = []
+    seen_ids = set()
+
+    for item in day.get("items", []):
+        place_id = item.get("place_id", "")
+        place = get_candidate_by_id(candidates, place_id)
+
+        if place and place.get("id") not in seen_ids:
+            places.append(place)
+            seen_ids.add(place.get("id"))
+
+    return places
+
+
+def render_day_route_links(day, candidates, destination):
+    """
+    날짜별 일정 아래에 구간별 네이버지도 동선 확인 버튼을 표시한다.
+    예: A 장소 → B 장소 [네이버지도에서 동선 확인]
+    """
+    day_places = get_day_places(day, candidates)
+
+    if len(day_places) < 2:
+        return
+
+    st.markdown("#### 날짜별 동선 확인")
+    st.caption("각 버튼을 누르면 네이버지도에서 두 장소 사이의 이동 경로를 확인할 수 있습니다.")
+
+    for i in range(len(day_places) - 1):
+        start_place = day_places[i]
+        end_place = day_places[i + 1]
+        route_link = make_route_search_link(start_place, end_place, destination)
+
+        route_col1, route_col2 = st.columns([2, 1])
+
+        with route_col1:
+            st.markdown(f"**{start_place['title']} → {end_place['title']}**")
+
+        with route_col2:
+            st.link_button(
+                "네이버지도에서 동선 확인",
+                route_link,
+                use_container_width=True,
+            )
+
+
 def render_extra_place_recommendations(plan_data, candidates, max_items=6):
     used_place_ids = get_used_place_ids(plan_data)
 
@@ -830,7 +898,7 @@ def render_metric_card(label, value, caption=""):
     )
 
 
-def render_travel_plan(plan_data, candidates, budget_plan):
+def render_travel_plan(plan_data, candidates, budget_plan, destination):
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("## 전체 여행 요약")
     st.write(plan_data.get("summary", ""))
@@ -889,6 +957,9 @@ def render_travel_plan(plan_data, candidates, budget_plan):
                         """,
                         unsafe_allow_html=True,
                     )
+
+                st.divider()
+                render_day_route_links(day, candidates, destination)
 
     render_extra_place_recommendations(plan_data, candidates)
 
@@ -1398,7 +1469,8 @@ else:
         st.text(get_korea_price_guide())
 
     render_travel_plan(
-    result["plan_data"],
-    result["candidates"],
-    result["budget_plan"]
-)
+        result["plan_data"],
+        result["candidates"],
+        result["budget_plan"],
+        result["destination"],
+    )
