@@ -4,26 +4,183 @@ from dotenv import load_dotenv
 import os
 import requests
 from urllib.parse import quote
+import re
+import json
+import html
+from datetime import date, timedelta
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def get_secret(name):
+    value = os.getenv(name)
+    if value:
+        return value
+
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
 
 
-def get_weather(destination):
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+NAVER_CLIENT_ID = get_secret("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = get_secret("NAVER_CLIENT_SECRET")
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+REGION_ALIASES = {
+    "서울": ["서울", "서울시", "서울특별시"],
+    "부산": ["부산", "부산시", "부산광역시"],
+    "대구": ["대구", "대구시", "대구광역시"],
+    "인천": ["인천", "인천시", "인천광역시"],
+    "광주": ["광주", "광주시", "광주광역시"],
+    "대전": ["대전", "대전시", "대전광역시"],
+    "울산": ["울산", "울산시", "울산광역시"],
+    "세종": ["세종", "세종시", "세종특별자치시"],
+    "경기": ["경기", "경기도"],
+    "강원": ["강원", "강원도", "강원특별자치도"],
+    "충북": ["충북", "충청북도"],
+    "충남": ["충남", "충청남도"],
+    "전북": ["전북", "전라북도", "전북특별자치도"],
+    "전남": ["전남", "전라남도"],
+    "경북": ["경북", "경상북도"],
+    "경남": ["경남", "경상남도"],
+    "제주": ["제주", "제주도", "제주특별자치도"],
+}
+
+
+def clean_html(text):
+    if not text:
+        return ""
+
+    text = re.sub(r"<.*?>", "", text)
+    return html.unescape(text)
+
+
+def extract_broad_region(text):
+    if not text:
+        return None
+
+    for region, aliases in REGION_ALIASES.items():
+        for alias in aliases:
+            if alias in text:
+                return region
+
+    return None
+
+
+def make_naver_map_search_link(query):
+    encoded_query = quote(query)
+    return f"https://map.naver.com/p/search/{encoded_query}"
+
+
+def make_naver_place_link(place):
+    title = place.get("title", "")
+    address = place.get("road_address") or place.get("address", "")
+
+    if address:
+        query = f"{title} {address}"
+    else:
+        query = title
+
+    return make_naver_map_search_link(query)
+
+
+def search_naver_local(query, display=5):
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return []
+
+    url = "https://openapi.naver.com/v1/search/local.json"
+
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+    }
+
+    params = {
+        "query": query,
+        "display": min(display, 5)
+    }
+
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+
+        if res.status_code != 200:
+            return []
+
+        data = res.json()
+        items = data.get("items", [])
+
+        results = []
+
+        for item in items:
+            title = clean_html(item.get("title", ""))
+            category = clean_html(item.get("category", ""))
+            address = clean_html(item.get("address", ""))
+            road_address = clean_html(item.get("roadAddress", ""))
+
+            if not title:
+                continue
+
+            results.append({
+                "title": title,
+                "category": category,
+                "address": address,
+                "road_address": road_address
+            })
+
+        return results
+
+    except Exception:
+        return []
+
+
+def address_matches_region(place, broad_region):
+    if not broad_region:
+        return True
+
+    address_text = f"{place.get('address', '')} {place.get('road_address', '')}"
+
+    aliases = REGION_ALIASES.get(broad_region, [broad_region])
+
+    return any(alias in address_text for alias in aliases)
+
+
+def get_weather_location(destination):
+    broad_region = extract_broad_region(destination)
+
+    if broad_region:
+        return broad_region
+
+    tokens = destination.split()
+
+    if tokens:
+        return tokens[0]
+
+    return destination
+
+
+def get_weather(destination, start_date, end_date):
+    weather_location = get_weather_location(destination)
+
     geo_url = "https://geocoding-api.open-meteo.com/v1/search"
     geo_params = {
-        "name": destination,
+        "name": weather_location,
         "count": 1,
         "language": "ko",
         "format": "json"
     }
 
-    geo_res = requests.get(geo_url, params=geo_params)
-    geo_data = geo_res.json()
+    try:
+        geo_res = requests.get(geo_url, params=geo_params, timeout=10)
+        geo_data = geo_res.json()
+    except Exception:
+        return "날씨 정보를 가져오는 중 오류가 발생했습니다."
 
     if "results" not in geo_data:
-        return "날씨 정보를 가져올 수 없습니다. 여행지 이름을 더 정확히 입력해 주세요."
+        return f"날씨 정보를 가져올 수 없습니다. 날씨 기준 지역: {weather_location}"
 
     location = geo_data["results"][0]
     lat = location["latitude"]
@@ -34,16 +191,29 @@ def get_weather(destination):
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-        "forecast_days": 7,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
         "timezone": "auto"
     }
 
-    weather_res = requests.get(weather_url, params=weather_params)
-    weather_data = weather_res.json()
+    try:
+        weather_res = requests.get(weather_url, params=weather_params, timeout=10)
+        weather_data = weather_res.json()
+    except Exception:
+        return "날씨 정보를 가져오는 중 오류가 발생했습니다."
+
+    if "daily" not in weather_data:
+        return (
+            f"해당 기간의 상세 날씨 예보를 가져올 수 없습니다. "
+            f"날씨 기준 지역은 {weather_location}입니다. "
+            f"너무 먼 날짜는 예보가 제공되지 않을 수 있습니다."
+        )
 
     daily = weather_data["daily"]
 
-    summary = "날씨 예보:\n"
+    summary = f"날씨 기준 지역: {weather_location}\n"
+    summary += "날씨 예보:\n"
+
     for i in range(len(daily["time"])):
         summary += (
             f"- {daily['time'][i]}: "
@@ -55,21 +225,316 @@ def get_weather(destination):
     return summary
 
 
-def make_google_maps_link(destination, keyword):
-    query = f"{destination} {keyword}"
-    encoded_query = quote(query)
-    return f"https://www.google.com/maps/search/{encoded_query}"
+def parse_budget_to_won(budget_text):
+    if not budget_text:
+        return None
+
+    text = budget_text.replace(",", "").replace(" ", "")
+    match = re.search(r"\d+(\.\d+)?", text)
+
+    if not match:
+        return None
+
+    amount = float(match.group())
+
+    if "만원" in text or "만" in text:
+        return int(amount * 10000)
+    elif "천원" in text:
+        return int(amount * 1000)
+    else:
+        return int(amount)
+
+
+def format_won(amount):
+    return f"{amount:,}원"
+
+
+def calculate_budget_plan(total_budget, days):
+    if total_budget is None:
+        return None
+
+    lodging = int(total_budget * 0.35)
+    food = int(total_budget * 0.28)
+    transport = int(total_budget * 0.14)
+    activity = int(total_budget * 0.13)
+    emergency = total_budget - lodging - food - transport - activity
+    daily_budget = int(total_budget / days)
+
+    if daily_budget < 70000:
+        budget_level = "초절약형"
+        budget_warning = "1일 예산이 낮은 편입니다. 무료 관광지, 대중교통, 저가 숙소 중심으로 계획하는 것이 좋습니다."
+    elif daily_budget < 120000:
+        budget_level = "절약형"
+        budget_warning = "가성비 여행이 적합합니다. 숙박과 식비를 조절하면 무리 없이 여행할 수 있습니다."
+    elif daily_budget < 200000:
+        budget_level = "일반형"
+        budget_warning = "일반적인 국내 여행 예산으로 무난한 일정 구성이 가능합니다."
+    else:
+        budget_level = "여유형"
+        budget_warning = "숙소, 음식, 체험 활동 선택 폭이 넓은 예산입니다."
+
+    return {
+        "총 예산": total_budget,
+        "1일 평균 예산": daily_budget,
+        "숙박비": lodging,
+        "식비": food,
+        "교통비": transport,
+        "관광/체험비": activity,
+        "예비비": emergency,
+        "예산 유형": budget_level,
+        "예산 코멘트": budget_warning
+    }
+
+
+def get_korea_price_guide():
+    return """
+한국 여행 물가 보정 기준:
+- 일반 식사 1끼: 10,000원부터 15,000원
+- 국밥/분식/간단한 식사: 8,000원부터 12,000원
+- 카페 음료 1잔: 4,500원부터 7,000원
+- 프랜차이즈 치킨 1마리: 18,000원부터 25,000원
+- 택시 기본 이동: 5,000원부터 15,000원 이상
+- 시내 대중교통 1회: 약 1,500원 내외
+- 관광지 입장료: 무료부터 20,000원 수준
+- 국내 숙박 1박: 저가형 40,000원부터 80,000원, 일반형 80,000원부터 150,000원 이상
+
+주의:
+- 음식 가격을 지나치게 낮게 잡지 말 것.
+- 특히 치킨, 회, 고기, 해산물, 관광지 주변 음식은 보수적으로 계산할 것.
+- 2020년대 중반 한국 물가 기준으로 현실적인 비용을 제시할 것.
+"""
+
+
+def build_search_queries(destination, preference):
+    queries = []
+
+    base_keywords = [
+        "관광지",
+        "맛집",
+        "카페",
+        "실내 관광지",
+        "박물관",
+        "쇼핑",
+        "숙소"
+    ]
+
+    for keyword in base_keywords:
+        queries.append(f"{destination} {keyword}")
+
+    if preference:
+        preference_parts = re.split(r"[,/ ]+", preference)
+
+        for part in preference_parts:
+            part = part.strip()
+            if part:
+                queries.append(f"{destination} {part}")
+
+    return queries
+
+
+def get_verified_place_candidates(destination, preference):
+    broad_region = extract_broad_region(destination)
+
+    queries = build_search_queries(destination, preference)
+
+    candidates = []
+    seen = set()
+
+    for query in queries:
+        results = search_naver_local(query, display=5)
+
+        for place in results:
+            if not address_matches_region(place, broad_region):
+                continue
+
+            key = f"{place['title']}|{place.get('road_address') or place.get('address')}"
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            place_id = f"P{len(candidates) + 1:03d}"
+
+            place["id"] = place_id
+            place["map_link"] = make_naver_place_link(place)
+            candidates.append(place)
+
+    return candidates[:30]
+
+
+def format_candidates_for_prompt(candidates):
+    lines = []
+
+    for place in candidates:
+        lines.append(
+            f"{place['id']} | {place['title']} | "
+            f"카테고리: {place['category']} | "
+            f"주소: {place['road_address'] or place['address']}"
+        )
+
+    return "\n".join(lines)
+
+
+def get_candidate_by_id(candidates, place_id):
+    for place in candidates:
+        if place["id"] == place_id:
+            return place
+
+    return None
+
+
+def render_verified_candidates(candidates):
+    st.subheader("검증된 네이버 지역 장소 후보")
+    st.write("아래 후보는 네이버 지역 검색 API 결과를 지역 기준으로 필터링한 목록입니다.")
+
+    if not candidates:
+        st.warning("검증된 장소 후보가 없습니다. 여행지를 더 넓은 지역명으로 입력해 보세요. 예: 서울 명동, 부산 해운대")
+        return
+
+    cols = st.columns(2)
+
+    for idx, place in enumerate(candidates[:12]):
+        with cols[idx % 2]:
+            st.markdown(f"**{place['id']} · {place['title']}**")
+            st.caption(place["category"])
+            st.write(place["road_address"] or place["address"])
+            st.link_button("네이버지도에서 보기", place["map_link"])
+
+
+def render_travel_plan(plan_data, destination, candidates):
+    st.markdown("## 전체 여행 요약")
+    st.write(plan_data.get("summary", ""))
+
+    st.markdown("## 날씨 반영 전략")
+    st.write(plan_data.get("weather_strategy", ""))
+
+    st.markdown("## 예산 사용 전략")
+    st.write(plan_data.get("budget_strategy", ""))
+
+    st.markdown("## 날짜별 일정")
+
+    daily_schedule = plan_data.get("daily_schedule", [])
+
+    used_place_ids = []
+
+    for day in daily_schedule:
+        date_text = day.get("date", "")
+        title = day.get("day_title", "")
+        st.markdown(f"### {title} - {date_text}")
+
+        items = day.get("items", [])
+
+        for item in items:
+            time_text = item.get("time", "")
+            place_id = item.get("place_id", "")
+            description = item.get("description", "")
+            cost = item.get("estimated_cost", "")
+
+            place = get_candidate_by_id(candidates, place_id)
+
+            if place:
+                used_place_ids.append(place_id)
+                st.markdown(
+                    f"- **{time_text}**: "
+                    f"[{place['title']}]({place['map_link']}) - "
+                    f"{description} "
+                    f"`예상 비용: {cost}`"
+                )
+            else:
+                st.markdown(
+                    f"- **{time_text}**: {description} "
+                    f"`예상 비용: {cost}`"
+                )
+                if place_id:
+                    st.caption(f"검증되지 않은 장소 ID가 제외되었습니다: {place_id}")
+
+    st.markdown("## 예상 상세 예산")
+    st.write(plan_data.get("estimated_budget_detail", ""))
+
+    st.markdown("## 추천 음식")
+    foods = plan_data.get("recommended_foods", [])
+    for food in foods:
+        st.markdown(f"- {food}")
+
+    st.markdown("## 준비물")
+    packing_list = plan_data.get("packing_list", [])
+    for item in packing_list:
+        st.markdown(f"- {item}")
+
+    st.markdown("## 비 올 때 대체 일정")
+    rainy_items = plan_data.get("rainy_day_alternatives", [])
+    for item in rainy_items:
+        st.markdown(f"- {item}")
+
+    st.markdown("## 절약 팁")
+    saving_tips = plan_data.get("saving_tips", [])
+    for tip in saving_tips:
+        st.markdown(f"- {tip}")
+
+    recommended_place_ids = plan_data.get("recommended_place_ids", [])
+
+    all_link_ids = []
+
+    for place_id in recommended_place_ids:
+        if place_id not in all_link_ids:
+            all_link_ids.append(place_id)
+
+    for place_id in used_place_ids:
+        if place_id not in all_link_ids:
+            all_link_ids.append(place_id)
+
+    valid_places = [
+        get_candidate_by_id(candidates, place_id)
+        for place_id in all_link_ids
+        if get_candidate_by_id(candidates, place_id)
+    ]
+
+    if valid_places:
+        st.markdown("## 추천 장소 네이버지도 링크")
+        st.write("아래 버튼을 누르면 네이버지도에서 위치, 리뷰, 메뉴, 가격 정보를 확인할 수 있습니다.")
+
+        cols = st.columns(3)
+
+        for idx, place in enumerate(valid_places):
+            with cols[idx % 3]:
+                st.link_button(place["title"], place["map_link"])
 
 
 st.title("여행 계획 AI Agent")
-st.write("여행 조건을 입력하면 AI가 맞춤형 여행 일정을 생성합니다.")
+st.write("여행 조건을 입력하면 AI가 날씨, 예산, 네이버 지역 검색 결과를 검증해 맞춤형 여행 일정을 생성합니다.")
 
-destination = st.text_input("여행지")
-days = st.number_input("여행 기간", min_value=1, max_value=10, value=2)
-budget = st.text_input("예산")
-preference = st.text_input("여행 취향")
+destination = st.text_input("여행지", placeholder="예: 서울 명동, 부산 해운대, 제주 서귀포")
 
-st.subheader("빠른 지도 검색")
+today = date.today()
+default_start = today
+default_end = today + timedelta(days=2)
+
+trip_range = st.date_input(
+    "여행 기간",
+    value=(default_start, default_end),
+    min_value=today
+)
+
+if isinstance(trip_range, tuple) and len(trip_range) == 2:
+    start_date, end_date = trip_range
+    days = (end_date - start_date).days + 1
+
+    if days < 1:
+        st.warning("종료일은 시작일보다 늦거나 같아야 합니다.")
+        days = 1
+    else:
+        st.caption(f"선택한 여행 기간: {start_date} ~ {end_date} / 총 {days}일")
+else:
+    start_date = today
+    end_date = today
+    days = 1
+    st.info("여행 시작일과 종료일을 모두 선택해 주세요.")
+
+budget = st.text_input("예산", placeholder="예: 35만원, 500000원")
+preference = st.text_input("여행 취향", placeholder="예: 맛집, 바다, 자연, 카페")
+
+st.subheader("빠른 네이버지도 검색")
 
 if destination:
     col1, col2, col3 = st.columns(3)
@@ -77,104 +542,202 @@ if destination:
     with col1:
         st.link_button(
             "관광지 검색",
-            make_google_maps_link(destination, "관광지")
+            make_naver_map_search_link(f"{destination} 관광지")
         )
 
     with col2:
         st.link_button(
             "맛집 검색",
-            make_google_maps_link(destination, "맛집")
+            make_naver_map_search_link(f"{destination} 맛집")
         )
 
     with col3:
         st.link_button(
             "카페 검색",
-            make_google_maps_link(destination, "카페")
+            make_naver_map_search_link(f"{destination} 카페")
         )
 else:
-    st.info("여행지를 입력하면 지도 검색 버튼이 표시됩니다.")
+    st.info("여행지를 입력하면 네이버지도 검색 버튼이 표시됩니다.")
 
 
 if st.button("여행 계획 생성"):
-    if not destination:
+    if not OPENAI_API_KEY:
+        st.error("OPENAI_API_KEY가 설정되어 있지 않습니다. Streamlit Secrets 또는 .env 파일을 확인해 주세요.")
+    elif not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        st.error("NAVER_CLIENT_ID와 NAVER_CLIENT_SECRET이 필요합니다. 장소 검증 기능을 위해 Streamlit Secrets에 네이버 API 키를 추가해 주세요.")
+    elif not destination:
         st.warning("여행지를 입력해 주세요.")
     elif not budget:
         st.warning("예산을 입력해 주세요.")
     elif not preference:
         st.warning("여행 취향을 입력해 주세요.")
+    elif days < 1:
+        st.warning("여행 기간을 올바르게 선택해 주세요.")
     else:
-        weather_info = get_weather(destination)
+        total_budget = parse_budget_to_won(budget)
+        budget_plan = calculate_budget_plan(total_budget, days)
 
-        st.subheader("여행지 날씨 정보")
-        st.write(weather_info)
+        if budget_plan is None:
+            st.warning("예산 형식을 인식하지 못했습니다. 예: 35만원, 500000원")
+        else:
+            weather_info = get_weather(destination, start_date, end_date)
+            price_guide = get_korea_price_guide()
+            candidates = get_verified_place_candidates(destination, preference)
+            candidates_text = format_candidates_for_prompt(candidates)
 
-        prompt = f"""
-        너는 전문 여행 플래너 AI Agent야.
+            st.subheader("여행지 날씨 정보")
+            st.write(weather_info)
 
-        아래 조건과 날씨 정보를 반영해서 여행 계획을 작성해줘.
+            st.subheader("예산 분석")
+            st.write(f"총 예산: {format_won(budget_plan['총 예산'])}")
+            st.write(f"1일 평균 예산: {format_won(budget_plan['1일 평균 예산'])}")
+            st.write(f"예산 유형: {budget_plan['예산 유형']}")
+            st.info(budget_plan["예산 코멘트"])
 
-        여행지: {destination}
-        여행 기간: {days}일
-        예산: {budget}
-        여행 취향: {preference}
+            budget_col1, budget_col2 = st.columns(2)
 
-        날씨 정보:
-        {weather_info}
+            with budget_col1:
+                st.write(f"숙박비: {format_won(budget_plan['숙박비'])}")
+                st.write(f"식비: {format_won(budget_plan['식비'])}")
+                st.write(f"교통비: {format_won(budget_plan['교통비'])}")
 
-        작성 조건:
-        - 강수확률이 높은 날은 실내 관광지, 카페, 박물관, 쇼핑몰 위주로 추천해줘.
-        - 날씨가 좋은 날은 야외 관광지, 자연 경관, 산책 코스를 추천해줘.
-        - 예산을 초과하지 않도록 현실적인 일정으로 구성해줘.
-        - 이동 동선이 너무 복잡하지 않게 구성해줘.
-        - 추천한 장소를 사용자가 지도에서 검색할 수 있도록 장소명을 명확하게 작성해줘.
+            with budget_col2:
+                st.write(f"관광/체험비: {format_won(budget_plan['관광/체험비'])}")
+                st.write(f"예비비: {format_won(budget_plan['예비비'])}")
 
-        출력 형식:
-        1. 전체 여행 요약
-        2. 날씨 반영 전략
-        3. 날짜별 일정
-        4. 예상 예산
-        5. 추천 음식
-        6. 준비물
-        7. 비 올 때 대체 일정
-        """
+            with st.expander("한국 물가 보정 기준 보기"):
+                st.text(price_guide)
 
-        with st.spinner("AI가 여행 계획을 생성 중입니다..."):
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "너는 날씨, 예산, 취향, 이동 동선을 반영해서 여행 계획을 세워주는 전문 AI Agent야."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
-            )
+            render_verified_candidates(candidates)
 
-            result = response.choices[0].message.content
+            if not candidates:
+                st.stop()
 
-            st.subheader("AI 여행 계획")
-            st.write(result)
+            prompt = f"""
+            너는 전문 여행 플래너 AI Agent야.
 
-            st.subheader("추가 지도 검색")
-            col4, col5, col6 = st.columns(3)
+            아래 조건, 여행 기간, 날씨 정보, 예산 분석 정보, 한국 물가 보정 기준, 검증된 네이버 지역 검색 장소 후보를 모두 반영해서 여행 계획을 작성해줘.
 
-            with col4:
-                st.link_button(
-                    "숙소 검색",
-                    make_google_maps_link(destination, "숙소")
-                )
+            여행지: {destination}
+            여행 기간: {start_date}부터 {end_date}까지, 총 {days}일
+            사용자가 입력한 예산: {budget}
+            여행 취향: {preference}
 
-            with col5:
-                st.link_button(
-                    "대중교통 검색",
-                    make_google_maps_link(destination, "대중교통")
-                )
+            날씨 정보:
+            {weather_info}
 
-            with col6:
-                st.link_button(
-                    "실내 관광지 검색",
-                    make_google_maps_link(destination, "실내 관광지")
-                )
+            예산 분석:
+            - 총 예산: {format_won(budget_plan['총 예산'])}
+            - 1일 평균 예산: {format_won(budget_plan['1일 평균 예산'])}
+            - 숙박비: {format_won(budget_plan['숙박비'])}
+            - 식비: {format_won(budget_plan['식비'])}
+            - 교통비: {format_won(budget_plan['교통비'])}
+            - 관광/체험비: {format_won(budget_plan['관광/체험비'])}
+            - 예비비: {format_won(budget_plan['예비비'])}
+            - 예산 유형: {budget_plan['예산 유형']}
+            - 예산 코멘트: {budget_plan['예산 코멘트']}
+
+            한국 물가 보정 기준:
+            {price_guide}
+
+            검증된 네이버 지역 검색 장소 후보:
+            {candidates_text}
+
+            매우 중요한 규칙:
+            - 장소는 반드시 위의 검증된 후보 목록에 있는 place_id만 사용해.
+            - 새로운 장소명, 임의 업체명, 과거에 있었던 브랜드명, 존재 여부가 불확실한 장소명은 절대 만들지 마.
+            - place_id는 반드시 P001, P002 같은 형식으로 후보 목록에 존재하는 값만 사용해.
+            - 후보 목록에 없는 장소가 필요하면, 장소명을 새로 만들지 말고 description에 “후보 목록 내 대체 장소 사용”이라고 설명해.
+            - recommended_place_ids도 반드시 후보 목록의 place_id만 사용해.
+            - 예술의전당처럼 여행지와 다른 구역의 장소는 후보에 없으면 사용하지 마.
+            - 노고단처럼 여행지와 공간적으로 맞지 않는 장소는 사용하지 마.
+            - Mango Six, 노고단처럼 실제 검증되지 않은 장소명은 절대 생성하지 마.
+
+            반드시 아래 JSON 형식으로만 답변해줘.
+            마크다운 문법은 사용하지 말고, JSON 이외의 설명도 쓰지 마.
+
+            {{
+              "summary": "전체 여행 요약",
+              "weather_strategy": "날씨를 어떻게 반영했는지 설명",
+              "budget_strategy": "예산을 어떻게 배분했는지 설명",
+              "daily_schedule": [
+                {{
+                  "date": "YYYY-MM-DD",
+                  "day_title": "1일차",
+                  "items": [
+                    {{
+                      "time": "아침",
+                      "place_id": "P001",
+                      "description": "일정 설명",
+                      "estimated_cost": "예상 비용"
+                    }}
+                  ]
+                }}
+              ],
+              "estimated_budget_detail": "상세 예산 설명",
+              "recommended_foods": ["추천 음식 1", "추천 음식 2"],
+              "packing_list": ["준비물 1", "준비물 2"],
+              "rainy_day_alternatives": ["우천 시 대체 일정 1", "우천 시 대체 일정 2"],
+              "saving_tips": ["절약 팁 1", "절약 팁 2"],
+              "recommended_place_ids": ["P001", "P002", "P003"]
+            }}
+
+            조건:
+            - 날짜는 반드시 사용자가 선택한 날짜 범위와 일치해야 해.
+            - daily_schedule의 날짜 개수는 반드시 {days}개여야 해.
+            - 하루에 아침, 점심, 오후, 저녁 중심으로 일정을 구성해줘.
+            - 강수확률이 높은 날은 실내 관광지, 카페, 박물관, 쇼핑몰 위주로 추천해줘.
+            - 날씨가 좋은 날은 야외 관광지, 자연 경관, 산책 코스를 추천해줘.
+            - 예산을 초과하지 않도록 현실적인 일정으로 구성해줘.
+            - 한국 물가 보정 기준을 반드시 반영해줘.
+            - 음식 가격을 지나치게 낮게 잡지 마.
+            - 이동 동선이 너무 복잡하지 않게 구성해줘.
+            """
+
+            with st.spinner("여행 계획을 생성 중입니다..."):
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "너는 검증된 장소 후보 안에서만 여행 일정을 구성하는 전문 AI Agent야. 후보에 없는 장소를 절대 만들지 않는다."
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt
+                            }
+                        ]
+                    )
+
+                    result = response.choices[0].message.content
+                    plan_data = json.loads(result)
+
+                    render_travel_plan(plan_data, destination, candidates)
+
+                    st.subheader("추가 네이버지도 검색")
+                    col4, col5, col6 = st.columns(3)
+
+                    with col4:
+                        st.link_button(
+                            "숙소 검색",
+                            make_naver_map_search_link(f"{destination} 숙소")
+                        )
+
+                    with col5:
+                        st.link_button(
+                            "대중교통 검색",
+                            make_naver_map_search_link(f"{destination} 대중교통")
+                        )
+
+                    with col6:
+                        st.link_button(
+                            "실내 관광지 검색",
+                            make_naver_map_search_link(f"{destination} 실내 관광지")
+                        )
+
+                except json.JSONDecodeError:
+                    st.error("AI 응답을 처리하는 중 오류가 발생했습니다. 다시 시도해 주세요.")
+                except Exception as e:
+                    st.error(f"오류가 발생했습니다: {e}")
