@@ -1392,6 +1392,295 @@ def generate_travel_plan(destination, start_date, end_date, days, budget, prefer
     }
 
 
+
+
+def normalize_candidate_key(place):
+    """
+    장소 중복 여부를 판단하기 위한 키를 만든다.
+    같은 장소가 여러 검색어에서 반복 등장하는 것을 방지한다.
+    """
+    title = str(place.get("title", "")).strip()
+    address = str(place.get("road_address") or place.get("address") or "").strip()
+    return f"{title}|{address}"
+
+
+def get_next_place_id(candidates):
+    """
+    기존 후보 장소의 P001, P002 형식 ID를 유지하면서
+    새 장소에는 다음 번호를 부여한다.
+    """
+    max_num = 0
+
+    for place in candidates:
+        place_id = str(place.get("id", ""))
+        match = re.match(r"P(\d+)$", place_id)
+
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+
+    return max_num + 1
+
+
+def build_edit_search_queries(destination, edit_request):
+    """
+    사용자의 일정 수정 요청을 보고 추가로 필요한 네이버 지역 검색어를 만든다.
+    예: 아침식사 추가, 닭고기 제외, 실내 일정 변경 등.
+    """
+    request = edit_request or ""
+    keywords = []
+
+    if any(word in request for word in ["아침", "조식", "브런치", "모닝"]):
+        keywords.extend(["아침식사", "조식", "브런치", "카페"])
+
+    if any(word in request for word in ["점심", "저녁", "식사", "음식", "먹", "맛집"]):
+        keywords.extend(["맛집", "한식", "일식", "중식", "분식", "양식"])
+
+    if any(word in request for word in ["닭", "닭고기", "치킨", "삼계탕"]):
+        keywords.extend(["한식", "생선구이", "국밥", "일식", "중식", "분식"])
+
+    if any(word in request for word in ["고기", "육류"]):
+        keywords.extend(["해산물", "생선구이", "일식", "분식", "채식", "샐러드"])
+
+    if any(word in request for word in ["비", "우천", "실내", "더워", "추워", "눈"]):
+        keywords.extend(["실내 관광지", "박물관", "미술관", "쇼핑몰", "카페"])
+
+    if any(word in request for word in ["관광", "명소", "볼거리", "체험", "산책"]):
+        keywords.extend(["관광지", "명소", "체험", "공원", "전시"])
+
+    # 어떤 요청이든 기본 후보는 확보한다.
+    keywords.extend(["맛집", "카페", "관광지", "실내 관광지"])
+
+    unique_keywords = []
+    for keyword in keywords:
+        if keyword not in unique_keywords:
+            unique_keywords.append(keyword)
+
+    return [f"{destination} {keyword}" for keyword in unique_keywords]
+
+
+def search_edit_place_candidates(destination, edit_request):
+    """
+    일정 수정에 필요한 추가 장소 후보를 네이버 지역 검색 API로 가져온다.
+    """
+    broad_region = extract_broad_region(destination)
+    queries = build_edit_search_queries(destination, edit_request)
+    candidates = []
+    seen = set()
+
+    for query in queries:
+        raw_results, _ = search_naver_local(query, display=5)
+
+        filtered_results = [
+            place for place in raw_results
+            if address_matches_region(place, broad_region)
+        ]
+
+        # 지역 필터가 너무 강해서 결과가 없는 경우에는 원본 결과도 보조적으로 사용한다.
+        if not filtered_results:
+            filtered_results = raw_results
+
+        for place in filtered_results:
+            key = normalize_candidate_key(place)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            place["map_link"] = make_naver_place_link(place, destination)
+            candidates.append(place)
+
+    return candidates
+
+
+def merge_candidates_for_edit(existing_candidates, new_candidates, destination):
+    """
+    기존 장소 후보는 ID를 유지하고, 새 후보만 뒤에 추가한다.
+    """
+    merged = [dict(place) for place in existing_candidates]
+    seen = {normalize_candidate_key(place) for place in merged}
+    next_id = get_next_place_id(merged)
+
+    for place in new_candidates:
+        key = normalize_candidate_key(place)
+        if key in seen:
+            continue
+
+        new_place = dict(place)
+        new_place["id"] = f"P{next_id:03d}"
+        new_place["map_link"] = make_naver_place_link(new_place, destination)
+        merged.append(new_place)
+        seen.add(key)
+        next_id += 1
+
+    return merged[:45]
+
+
+def revise_travel_plan_with_ai(result, edit_request):
+    """
+    현재 생성된 여행 계획을 사용자의 자연어 요청에 맞게 수정한다.
+    수정 후 화면 일정, 동선 링크, PDF가 모두 같은 데이터 기준으로 갱신된다.
+    """
+    destination = result["destination"]
+    start_date = result["start_date"]
+    end_date = result["end_date"]
+    days = result["days"]
+    budget = result["budget"]
+    preference = result["preference"]
+    weather_info = result["weather_info"]
+    budget_plan = result["budget_plan"]
+    current_plan = result["plan_data"]
+    existing_candidates = result["candidates"]
+
+    extra_candidates = search_edit_place_candidates(destination, edit_request)
+    merged_candidates = merge_candidates_for_edit(existing_candidates, extra_candidates, destination)
+    candidates_text = format_candidates_for_prompt(merged_candidates)
+
+    current_plan_json = json.dumps(current_plan, ensure_ascii=False, indent=2)
+
+    prompt = f"""
+    너는 여행 일정을 수정하는 전문 AI Agent야.
+
+    사용자는 이미 생성된 여행 일정 중 일부를 바꾸고 싶어 한다.
+    아래의 현재 여행 계획 JSON을 기준으로, 사용자의 수정 요청을 반영한 전체 여행 계획 JSON을 다시 작성해줘.
+
+    여행지: {destination}
+    여행 기간: {start_date}부터 {end_date}까지, 총 {days}일
+    예산: {budget}
+    여행 취향: {preference}
+
+    날씨 정보:
+    {weather_info}
+
+    예산 분석:
+    - 총 예산: {format_won(budget_plan['총 예산'])}
+    - 1일 평균 예산: {format_won(budget_plan['1일 평균 예산'])}
+    - 숙박비: {format_won(budget_plan['숙박비'])}
+    - 식비: {format_won(budget_plan['식비'])}
+    - 교통비: {format_won(budget_plan['교통비'])}
+    - 관광/체험비: {format_won(budget_plan['관광/체험비'])}
+    - 예비비: {format_won(budget_plan['예비비'])}
+    - 예산 유형: {budget_plan['예산 유형']}
+
+    현재 여행 계획 JSON:
+    {current_plan_json}
+
+    사용자의 수정 요청:
+    {edit_request}
+
+    사용할 수 있는 검증된 네이버 지역 검색 장소 후보:
+    {candidates_text}
+
+    매우 중요한 수정 규칙:
+    - 사용자의 수정 요청과 관련된 부분만 바꾸고, 나머지 일정은 최대한 유지해.
+    - 예를 들어 "둘째 날 점심만 바꿔줘"라고 하면 둘째 날 점심 외의 일정은 바꾸지 마.
+    - 장소는 반드시 위 후보 목록에 있는 place_id만 사용해.
+    - 새로운 장소명, 임의 업체명, 존재 여부가 불확실한 장소명은 절대 만들지 마.
+    - 사용자가 특정 음식을 싫어한다고 하면 해당 음식이 포함된 식당/메뉴를 피해서 바꿔.
+    - 사용자가 아침식사를 추가해달라고 하면 해당 날짜의 아침 항목에 식사 장소를 넣어.
+    - 날짜 개수는 반드시 {days}개를 유지해.
+    - 날짜는 반드시 {start_date}부터 {end_date} 범위와 일치해야 해.
+    - 예산을 과도하게 초과하지 않도록 현실적인 비용을 넣어.
+    - 준비물과 절약 팁 항목은 작성하지 마.
+
+    반드시 아래 JSON 형식으로만 답변해줘.
+    마크다운 문법은 사용하지 말고, JSON 이외의 설명도 쓰지 마.
+
+    {{
+      "summary": "전체 여행 요약",
+      "weather_strategy": "날씨를 어떻게 반영했는지 설명",
+      "budget_strategy": "예산을 어떻게 배분했는지 설명",
+      "daily_schedule": [
+        {{
+          "date": "YYYY-MM-DD",
+          "day_title": "1일차",
+          "items": [
+            {{
+              "time": "아침",
+              "place_id": "P001",
+              "description": "일정 설명",
+              "estimated_cost": "예상 비용"
+            }}
+          ]
+        }}
+      ],
+      "estimated_budget_detail": "상세 예산 설명",
+      "recommended_foods": ["추천 음식 1", "추천 음식 2"],
+      "rainy_day_alternatives": ["우천 시 대체 일정 1", "우천 시 대체 일정 2"]
+    }}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "너는 기존 여행 일정을 사용자의 요청에 맞게 최소 변경하는 전문 AI Agent야. 반드시 후보 목록에 있는 장소 ID만 사용한다.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    )
+
+    revised_plan_data = json.loads(response.choices[0].message.content)
+
+    pdf_bytes = build_travel_pdf(
+        destination=destination,
+        start_date=start_date,
+        end_date=end_date,
+        days=days,
+        weather_info=weather_info,
+        budget_plan=budget_plan,
+        plan_data=revised_plan_data,
+        candidates=merged_candidates,
+    )
+
+    revised_result = dict(result)
+    revised_result["plan_data"] = revised_plan_data
+    revised_result["candidates"] = merged_candidates
+    revised_result["pdf_bytes"] = pdf_bytes
+
+    return revised_result
+
+
+def render_schedule_editor(result):
+    """
+    생성된 여행 계획을 자연어로 수정하는 입력 영역을 표시한다.
+    """
+    st.markdown("## 일정 수정하기")
+    st.write("생성된 일정에서 마음에 들지 않는 부분을 자연어로 입력하면, AI가 해당 부분을 반영해 일정을 다시 구성합니다.")
+
+    with st.expander("수정 요청 예시 보기"):
+        st.markdown("- 첫째 날 아침에 아침식사를 추가해줘")
+        st.markdown("- 둘째 날 점심에 닭고기 말고 다른 음식으로 바꿔줘")
+        st.markdown("- 셋째 날 오후 일정을 실내 관광지로 바꿔줘")
+        st.markdown("- 전체 일정에서 너무 비싼 식당은 제외해줘")
+
+    with st.form("schedule_edit_form"):
+        edit_request = st.text_area(
+            "수정 요청",
+            placeholder="예: 둘째 날 점심에 닭고기가 포함돼 있는데, 닭고기가 아닌 다른 음식으로 바꿔줘.",
+            height=100,
+        )
+
+        edit_submitted = st.form_submit_button("일정 수정하기", use_container_width=True)
+
+    if edit_submitted:
+        if not edit_request.strip():
+            st.warning("수정 요청 내용을 입력해 주세요.")
+            return
+
+        with st.spinner("AI가 기존 일정을 수정 중입니다..."):
+            try:
+                st.session_state["travel_result"] = revise_travel_plan_with_ai(result, edit_request.strip())
+                st.session_state["edit_success_message"] = "일정이 수정되었습니다. 화면 일정과 PDF가 새 일정 기준으로 다시 생성되었습니다."
+                st.rerun()
+            except json.JSONDecodeError:
+                st.error("AI 수정 응답을 처리하는 중 오류가 발생했습니다. 다시 시도해 주세요.")
+            except Exception as e:
+                st.error(f"일정 수정 중 오류가 발생했습니다: {e}")
+
 st.markdown('<div class="main-title">여행 계획 AI Agent</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="sub-title">날씨, 예산, 실제 장소 데이터를 반영해 맞춤형 여행 일정을 생성합니다.</div>',
@@ -1526,6 +1815,12 @@ else:
 
     with st.expander("한국 물가 보정 기준 보기"):
         st.text(get_korea_price_guide())
+
+    edit_success_message = st.session_state.pop("edit_success_message", None)
+    if edit_success_message:
+        st.success(edit_success_message)
+
+    render_schedule_editor(result)
 
     render_travel_plan(
         result["plan_data"],
