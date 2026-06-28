@@ -96,15 +96,15 @@ def make_naver_map_search_link(query):
 
 
 def make_naver_place_link(place):
+    """
+    네이버지도는 장소명 + 상세주소를 함께 검색하면 오히려 검색 실패가 발생할 수 있다.
+    따라서 장소 링크는 장소명만 사용한다.
+    예:
+    - 훠궈먹고 명동점
+    - 서관면옥 신세계백화점 본점
+    """
     title = place.get("title", "")
-    address = place.get("road_address") or place.get("address", "")
-
-    if address:
-        query = f"{title} {address}"
-    else:
-        query = title
-
-    return make_naver_map_search_link(query)
+    return make_naver_map_search_link(title)
 
 
 def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
