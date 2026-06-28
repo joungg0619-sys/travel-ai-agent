@@ -13,14 +13,23 @@ load_dotenv()
 
 
 def get_secret(name):
+    """
+    Streamlit Cloud에서는 st.secrets를 우선 사용하고,
+    로컬 실행에서는 .env 또는 환경변수를 fallback으로 사용한다.
+    앞뒤 공백/줄바꿈 때문에 API 인증이 실패하지 않도록 strip() 처리한다.
+    """
+    try:
+        value = st.secrets[name]
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+
     value = os.getenv(name)
     if value:
-        return value
+        return str(value).strip()
 
-    try:
-        return st.secrets[name]
-    except Exception:
-        return None
+    return None
 
 
 def mask_secret(value):
@@ -454,7 +463,7 @@ def get_candidate_by_id(candidates, place_id):
 def render_naver_api_debug(destination):
     st.subheader("네이버 API 진단 모드")
 
-    st.write("이 영역은 네이버 지역 검색 API가 Streamlit 서버에서 정상 작동하는지 확인하기 위한 진단 기능입니다.")
+    st.write("현재 버전은 Streamlit Secrets를 먼저 읽고, 값의 앞뒤 공백을 제거합니다.")
 
     st.write(f"OPENAI_API_KEY: {mask_secret(OPENAI_API_KEY)}")
     st.write(f"NAVER_CLIENT_ID: {mask_secret(NAVER_CLIENT_ID)}")
@@ -468,7 +477,7 @@ def render_naver_api_debug(destination):
     if st.button("네이버 API 연결 테스트"):
         raw = fetch_naver_local_raw(test_query, display=5)
 
-        st.write(f"요청 URL: https://openapi.naver.com/v1/search/local.json")
+        st.write("요청 URL: https://openapi.naver.com/v1/search/local.json")
         st.write(f"검색어: {test_query}")
         st.write(f"상태 코드: {raw.get('status_code')}")
 
@@ -487,7 +496,7 @@ def render_naver_api_debug(destination):
             st.write(error_text)
 
             st.info(
-                "401이면 Client ID/Secret 문제일 가능성이 높고, "
+                "401이면 Client ID/Secret 값이 잘못되었거나, 값에 공백/줄바꿈이 섞였을 가능성이 큽니다. "
                 "403이면 해당 애플리케이션에 검색 API 권한이 없을 가능성이 높습니다."
             )
 
