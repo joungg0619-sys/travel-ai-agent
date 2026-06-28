@@ -9,6 +9,7 @@ import json
 import html
 from datetime import date, timedelta
 from io import BytesIO
+import math
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -743,23 +744,82 @@ def get_used_place_ids(plan_data):
     return used_place_ids
 
 
+def get_place_lon_lat(place):
+    """
+    네이버 지역 검색 API의 mapx, mapy 값을 위도/경도로 변환한다.
+    mapx, mapy는 보통 경도/위도에 10,000,000을 곱한 값이다.
+    """
+    mapx = place.get("mapx")
+    mapy = place.get("mapy")
+
+    if not mapx or not mapy:
+        return None, None
+
+    try:
+        lon = float(mapx) / 10000000
+        lat = float(mapy) / 10000000
+    except Exception:
+        return None, None
+
+    # 한국 좌표 범위가 아니면 잘못된 값으로 판단
+    if not (120 <= lon <= 135 and 30 <= lat <= 40):
+        return None, None
+
+    return lon, lat
+
+
+def lon_lat_to_web_mercator(lon, lat):
+    """
+    네이버지도 길찾기 URL은 일반 위도/경도보다 Web Mercator 좌표를 더 안정적으로 받는다.
+    WGS84 lon/lat → Web Mercator x/y 변환.
+    """
+    x = lon * 20037508.34 / 180
+    y = math.log(math.tan((90 + lat) * math.pi / 360)) / (math.pi / 180)
+    y = y * 20037508.34 / 180
+
+    return x, y
+
+
+def make_naver_direction_point(place):
+    """
+    네이버지도 길찾기 URL에 들어갈 출발지/도착지 포인트 문자열을 만든다.
+    형식:
+    x좌표,y좌표,장소명,-,PLACE_POI
+    """
+    title = place.get("title", "").strip()
+    lon, lat = get_place_lon_lat(place)
+
+    if not title or lon is None or lat is None:
+        return None
+
+    x, y = lon_lat_to_web_mercator(lon, lat)
+    encoded_title = quote(title)
+
+    return f"{x:.7f},{y:.7f},{encoded_title},-,PLACE_POI"
+
 
 def make_route_search_link(start_place, end_place, destination):
     """
-    네이버지도에서 두 장소 사이의 동선을 확인하기 위한 검색 링크를 만든다.
-    네이버지도 URL 경유지 API를 직접 쓰지 않고, 검색어 기반으로 안정적으로 연결한다.
+    네이버지도 검색창이 아니라, 왼쪽 '길찾기' 탭에
+    출발지와 도착지가 들어가도록 directions URL을 만든다.
     """
-    start_name = start_place.get("title", "").strip()
-    end_name = end_place.get("title", "").strip()
-    location_keyword = get_location_keyword(destination)
+    start_point = make_naver_direction_point(start_place)
+    end_point = make_naver_direction_point(end_place)
 
-    if location_keyword:
-        query = f"{start_name}에서 {end_name} 가는 길 {location_keyword}"
-    else:
-        query = f"{start_name}에서 {end_name} 가는 길"
+    # 좌표를 만들 수 없을 때만 검색 방식으로 fallback
+    if not start_point or not end_point:
+        start_name = start_place.get("title", "").strip()
+        end_name = end_place.get("title", "").strip()
+        location_keyword = get_location_keyword(destination)
 
-    return make_naver_map_search_link(query)
+        if location_keyword:
+            query = f"{start_name}에서 {end_name} 가는 길 {location_keyword}"
+        else:
+            query = f"{start_name}에서 {end_name} 가는 길"
 
+        return make_naver_map_search_link(query)
+
+    return f"https://map.naver.com/p/directions/{start_point}/{end_point}/-/transit?c=15.00,0,0,0,dh"
 
 def get_day_places(day, candidates):
     """
@@ -957,6 +1017,8 @@ def render_travel_plan(plan_data, candidates, budget_plan, destination):
                         """,
                         unsafe_allow_html=True,
                     )
+                st.divider()
+                render_day_route_links(day, candidates, destination)
 
                 st.divider()
                 render_day_route_links(day, candidates, destination)
