@@ -8,16 +8,27 @@ import re
 import json
 import html
 from datetime import date, timedelta
+from io import BytesIO
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 load_dotenv()
 
 
 def get_secret(name):
-    """
-    Streamlit Cloud에서는 st.secrets를 우선 사용하고,
-    로컬 실행에서는 .env 또는 환경변수를 fallback으로 사용한다.
-    앞뒤 공백/줄바꿈 때문에 API 인증이 실패하지 않도록 strip() 처리한다.
-    """
     try:
         value = st.secrets[name]
         if value:
@@ -96,13 +107,7 @@ def make_naver_map_search_link(query):
 
 
 def make_naver_place_link(place):
-    """
-    네이버지도는 장소명 + 상세주소를 함께 검색하면 오히려 검색 실패가 발생할 수 있다.
-    따라서 장소 링크는 장소명만 사용한다.
-    예:
-    - 훠궈먹고 명동점
-    - 서관면옥 신세계백화점 본점
-    """
+    # 네이버지도는 장소명 + 상세주소보다 장소명 단독 검색이 더 안정적인 경우가 많음
     title = place.get("title", "")
     return make_naver_map_search_link(title)
 
@@ -114,7 +119,7 @@ def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
             "status_code": None,
             "error": "NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET이 설정되어 있지 않습니다.",
             "data": None,
-            "text": ""
+            "text": "",
         }
 
     url = "https://openapi.naver.com/v1/search/local.json"
@@ -122,23 +127,18 @@ def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
         "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
 
     params = {
         "query": query,
         "display": min(display, 5),
         "start": start,
-        "sort": sort
+        "sort": sort,
     }
 
     try:
-        res = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=10
-        )
+        res = requests.get(url, headers=headers, params=params, timeout=10)
 
         try:
             data = res.json()
@@ -150,7 +150,7 @@ def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
             "status_code": res.status_code,
             "error": None if res.status_code == 200 else res.text,
             "data": data,
-            "text": res.text
+            "text": res.text,
         }
 
     except Exception as e:
@@ -159,7 +159,7 @@ def fetch_naver_local_raw(query, display=5, start=1, sort="random"):
             "status_code": None,
             "error": str(e),
             "data": None,
-            "text": ""
+            "text": "",
         }
 
 
@@ -185,14 +185,16 @@ def search_naver_local(query, display=5):
         if not title:
             continue
 
-        results.append({
-            "title": title,
-            "category": category,
-            "address": address,
-            "road_address": road_address,
-            "mapx": mapx,
-            "mapy": mapy
-        })
+        results.append(
+            {
+                "title": title,
+                "category": category,
+                "address": address,
+                "road_address": road_address,
+                "mapx": mapx,
+                "mapy": mapy,
+            }
+        )
 
     return results, raw
 
@@ -229,7 +231,7 @@ def get_weather(destination, start_date, end_date):
         "name": weather_location,
         "count": 1,
         "language": "ko",
-        "format": "json"
+        "format": "json",
     }
 
     try:
@@ -252,7 +254,7 @@ def get_weather(destination, start_date, end_date):
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "timezone": "auto"
+        "timezone": "auto",
     }
 
     try:
@@ -341,7 +343,7 @@ def calculate_budget_plan(total_budget, days):
         "관광/체험비": activity,
         "예비비": emergency,
         "예산 유형": budget_level,
-        "예산 코멘트": budget_warning
+        "예산 코멘트": budget_warning,
     }
 
 
@@ -374,7 +376,7 @@ def build_search_queries(destination, preference):
         "실내 관광지",
         "박물관",
         "쇼핑",
-        "숙소"
+        "숙소",
     ]
 
     for keyword in base_keywords:
@@ -414,14 +416,16 @@ def get_verified_place_candidates(destination, preference, use_region_filter=Tru
 
         after_count = len(filtered_results)
 
-        diagnostics.append({
-            "query": query,
-            "status_code": raw_response.get("status_code"),
-            "ok": raw_response.get("ok"),
-            "before_filter": before_count,
-            "after_filter": after_count,
-            "error": raw_response.get("error")
-        })
+        diagnostics.append(
+            {
+                "query": query,
+                "status_code": raw_response.get("status_code"),
+                "ok": raw_response.get("ok"),
+                "before_filter": before_count,
+                "after_filter": after_count,
+                "error": raw_response.get("error"),
+            }
+        )
 
         for place in filtered_results:
             key = f"{place['title']}|{place.get('road_address') or place.get('address')}"
@@ -471,7 +475,7 @@ def render_naver_api_debug(destination):
 
     test_query = st.text_input(
         "네이버 API 테스트 검색어",
-        value=destination if destination else "진주"
+        value=destination if destination else "진주",
     )
 
     if st.button("네이버 API 연결 테스트"):
@@ -625,6 +629,249 @@ def render_travel_plan(plan_data, candidates):
                 st.link_button(place["title"], place["map_link"])
 
 
+def register_korean_pdf_fonts():
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+    except Exception:
+        pass
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+    except Exception:
+        pass
+
+
+def pdf_paragraph(text, style):
+    safe = html.escape(str(text or ""))
+    safe = safe.replace("\n", "<br/>")
+    return Paragraph(safe, style)
+
+
+def pdf_place_link(place, style):
+    title = html.escape(place.get("title", ""))
+    url = html.escape(place.get("map_link", ""), quote=True)
+
+    if url:
+        return Paragraph(f'<link href="{url}">{title}</link>', style)
+
+    return Paragraph(title, style)
+
+
+def build_travel_pdf(
+    destination,
+    start_date,
+    end_date,
+    days,
+    weather_info,
+    budget_plan,
+    plan_data,
+    candidates,
+):
+    register_korean_pdf_fonts()
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "KoreanTitle",
+        parent=styles["Title"],
+        fontName="HYGothic-Medium",
+        fontSize=20,
+        leading=26,
+        alignment=TA_CENTER,
+        spaceAfter=18,
+    )
+
+    h1_style = ParagraphStyle(
+        "KoreanH1",
+        parent=styles["Heading1"],
+        fontName="HYGothic-Medium",
+        fontSize=15,
+        leading=20,
+        spaceBefore=14,
+        spaceAfter=8,
+    )
+
+    h2_style = ParagraphStyle(
+        "KoreanH2",
+        parent=styles["Heading2"],
+        fontName="HYGothic-Medium",
+        fontSize=12,
+        leading=16,
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+
+    body_style = ParagraphStyle(
+        "KoreanBody",
+        parent=styles["BodyText"],
+        fontName="HYSMyeongJo-Medium",
+        fontSize=10,
+        leading=15,
+        spaceAfter=6,
+    )
+
+    small_style = ParagraphStyle(
+        "KoreanSmall",
+        parent=styles["BodyText"],
+        fontName="HYSMyeongJo-Medium",
+        fontSize=8,
+        leading=11,
+    )
+
+    story = []
+
+    story.append(pdf_paragraph("여행 계획 AI Agent 일정표", title_style))
+    story.append(pdf_paragraph(f"여행지: {destination}", body_style))
+    story.append(pdf_paragraph(f"여행 기간: {start_date} ~ {end_date} / 총 {days}일", body_style))
+    story.append(Spacer(1, 10))
+
+    story.append(pdf_paragraph("1. 전체 여행 요약", h1_style))
+    story.append(pdf_paragraph(plan_data.get("summary", ""), body_style))
+
+    story.append(pdf_paragraph("2. 날씨 정보", h1_style))
+    story.append(pdf_paragraph(weather_info, body_style))
+
+    story.append(pdf_paragraph("3. 예산 분석", h1_style))
+
+    budget_table_data = [
+        ["항목", "금액"],
+        ["총 예산", format_won(budget_plan["총 예산"])],
+        ["1일 평균 예산", format_won(budget_plan["1일 평균 예산"])],
+        ["숙박비", format_won(budget_plan["숙박비"])],
+        ["식비", format_won(budget_plan["식비"])],
+        ["교통비", format_won(budget_plan["교통비"])],
+        ["관광/체험비", format_won(budget_plan["관광/체험비"])],
+        ["예비비", format_won(budget_plan["예비비"])],
+        ["예산 유형", budget_plan["예산 유형"]],
+    ]
+
+    budget_table = Table(budget_table_data, colWidths=[160, 280])
+    budget_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+                ("FONTNAME", (0, 0), (-1, 0), "HYGothic-Medium"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+
+    story.append(budget_table)
+    story.append(Spacer(1, 8))
+    story.append(pdf_paragraph(budget_plan["예산 코멘트"], body_style))
+
+    story.append(pdf_paragraph("4. 날씨 반영 전략", h1_style))
+    story.append(pdf_paragraph(plan_data.get("weather_strategy", ""), body_style))
+
+    story.append(pdf_paragraph("5. 예산 사용 전략", h1_style))
+    story.append(pdf_paragraph(plan_data.get("budget_strategy", ""), body_style))
+
+    story.append(PageBreak())
+    story.append(pdf_paragraph("6. 날짜별 일정", h1_style))
+
+    daily_schedule = plan_data.get("daily_schedule", [])
+
+    for day in daily_schedule:
+        date_text = day.get("date", "")
+        title = day.get("day_title", "")
+        story.append(pdf_paragraph(f"{title} - {date_text}", h2_style))
+
+        table_data = [["시간", "장소", "설명", "예상 비용"]]
+
+        for item in day.get("items", []):
+            place_id = item.get("place_id", "")
+            place = get_candidate_by_id(candidates, place_id)
+
+            if place:
+                place_cell = pdf_place_link(place, small_style)
+            else:
+                place_cell = pdf_paragraph("검증된 장소 없음", small_style)
+
+            table_data.append(
+                [
+                    pdf_paragraph(item.get("time", ""), small_style),
+                    place_cell,
+                    pdf_paragraph(item.get("description", ""), small_style),
+                    pdf_paragraph(item.get("estimated_cost", ""), small_style),
+                ]
+            )
+
+        schedule_table = Table(table_data, colWidths=[55, 105, 230, 80])
+        schedule_table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+                    ("FONTNAME", (0, 0), (-1, 0), "HYGothic-Medium"),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+
+        story.append(schedule_table)
+        story.append(Spacer(1, 10))
+
+    story.append(PageBreak())
+
+    story.append(pdf_paragraph("7. 예상 상세 예산", h1_style))
+    story.append(pdf_paragraph(plan_data.get("estimated_budget_detail", ""), body_style))
+
+    story.append(pdf_paragraph("8. 추천 음식", h1_style))
+    for food in plan_data.get("recommended_foods", []):
+        story.append(pdf_paragraph(f"- {food}", body_style))
+
+    story.append(pdf_paragraph("9. 준비물", h1_style))
+    for item in plan_data.get("packing_list", []):
+        story.append(pdf_paragraph(f"- {item}", body_style))
+
+    story.append(pdf_paragraph("10. 비 올 때 대체 일정", h1_style))
+    for item in plan_data.get("rainy_day_alternatives", []):
+        story.append(pdf_paragraph(f"- {item}", body_style))
+
+    story.append(pdf_paragraph("11. 절약 팁", h1_style))
+    for tip in plan_data.get("saving_tips", []):
+        story.append(pdf_paragraph(f"- {tip}", body_style))
+
+    recommended_place_ids = plan_data.get("recommended_place_ids", [])
+
+    if recommended_place_ids:
+        story.append(pdf_paragraph("12. 네이버지도 확인 링크", h1_style))
+        story.append(pdf_paragraph("장소명은 PDF에서도 클릭 가능한 링크로 삽입했습니다.", body_style))
+
+        for place_id in recommended_place_ids:
+            place = get_candidate_by_id(candidates, place_id)
+
+            if place:
+                story.append(pdf_place_link(place, body_style))
+
+    doc.build(story)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 st.title("여행 계획 AI Agent")
 st.write("여행 조건을 입력하면 AI가 날씨, 예산, 네이버 지역 검색 결과를 검증해 맞춤형 여행 일정을 생성합니다.")
 
@@ -637,7 +884,7 @@ default_end = today + timedelta(days=2)
 trip_range = st.date_input(
     "여행 기간",
     value=(default_start, default_end),
-    min_value=today
+    min_value=today,
 )
 
 if isinstance(trip_range, tuple) and len(trip_range) == 2:
@@ -666,19 +913,19 @@ if destination:
     with col1:
         st.link_button(
             "관광지 검색",
-            make_naver_map_search_link(f"{destination} 관광지")
+            make_naver_map_search_link(f"{destination} 관광지"),
         )
 
     with col2:
         st.link_button(
             "맛집 검색",
-            make_naver_map_search_link(f"{destination} 맛집")
+            make_naver_map_search_link(f"{destination} 맛집"),
         )
 
     with col3:
         st.link_button(
             "카페 검색",
-            make_naver_map_search_link(f"{destination} 카페")
+            make_naver_map_search_link(f"{destination} 카페"),
         )
 else:
     st.info("여행지를 입력하면 네이버지도 검색 버튼이 표시됩니다.")
@@ -713,7 +960,7 @@ if st.button("여행 계획 생성"):
             strict_candidates, strict_diagnostics = get_verified_place_candidates(
                 destination,
                 preference,
-                use_region_filter=True
+                use_region_filter=True,
             )
 
             used_relaxed_filter = False
@@ -724,14 +971,14 @@ if st.button("여행 계획 생성"):
                 relaxed_candidates, relaxed_diagnostics = get_verified_place_candidates(
                     destination,
                     preference,
-                    use_region_filter=False
+                    use_region_filter=False,
                 )
 
                 if relaxed_candidates:
                     candidates = relaxed_candidates
                     diagnostics = {
                         "strict_filter": strict_diagnostics,
-                        "relaxed_filter": relaxed_diagnostics
+                        "relaxed_filter": relaxed_diagnostics,
                     }
                     used_relaxed_filter = True
 
@@ -851,13 +1098,13 @@ if st.button("여행 계획 생성"):
                         messages=[
                             {
                                 "role": "system",
-                                "content": "너는 검증된 장소 후보 안에서만 여행 일정을 구성하는 전문 AI Agent야. 후보에 없는 장소를 절대 만들지 않는다."
+                                "content": "너는 검증된 장소 후보 안에서만 여행 일정을 구성하는 전문 AI Agent야. 후보에 없는 장소를 절대 만들지 않는다.",
                             },
                             {
                                 "role": "user",
-                                "content": prompt
-                            }
-                        ]
+                                "content": prompt,
+                            },
+                        ],
                     )
 
                     result = response.choices[0].message.content
@@ -865,25 +1112,43 @@ if st.button("여행 계획 생성"):
 
                     render_travel_plan(plan_data, candidates)
 
+                    pdf_bytes = build_travel_pdf(
+                        destination=destination,
+                        start_date=start_date,
+                        end_date=end_date,
+                        days=days,
+                        weather_info=weather_info,
+                        budget_plan=budget_plan,
+                        plan_data=plan_data,
+                        candidates=candidates,
+                    )
+
+                    st.download_button(
+                        label="PDF 여행 일정표 다운로드",
+                        data=pdf_bytes,
+                        file_name=f"{destination.replace(' ', '_')}_travel_plan.pdf",
+                        mime="application/pdf",
+                    )
+
                     st.subheader("추가 네이버지도 검색")
                     col4, col5, col6 = st.columns(3)
 
                     with col4:
                         st.link_button(
                             "숙소 검색",
-                            make_naver_map_search_link(f"{destination} 숙소")
+                            make_naver_map_search_link(f"{destination} 숙소"),
                         )
 
                     with col5:
                         st.link_button(
                             "대중교통 검색",
-                            make_naver_map_search_link(f"{destination} 대중교통")
+                            make_naver_map_search_link(f"{destination} 대중교통"),
                         )
 
                     with col6:
                         st.link_button(
                             "실내 관광지 검색",
-                            make_naver_map_search_link(f"{destination} 실내 관광지")
+                            make_naver_map_search_link(f"{destination} 실내 관광지"),
                         )
 
                 except json.JSONDecodeError:
