@@ -43,16 +43,6 @@ def get_secret(name):
     return None
 
 
-def mask_secret(value):
-    if not value:
-        return "없음"
-
-    if len(value) <= 8:
-        return "설정됨"
-
-    return value[:4] + "..." + value[-4:]
-
-
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 NAVER_CLIENT_ID = get_secret("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = get_secret("NAVER_CLIENT_SECRET")
@@ -84,7 +74,6 @@ REGION_ALIASES = {
 def clean_html(text):
     if not text:
         return ""
-
     text = re.sub(r"<.*?>", "", text)
     return html.unescape(text)
 
@@ -107,7 +96,6 @@ def make_naver_map_search_link(query):
 
 
 def make_naver_place_link(place):
-    # 네이버지도는 장소명 + 상세주소보다 장소명 단독 검색이 더 안정적인 경우가 많음
     title = place.get("title", "")
     return make_naver_map_search_link(title)
 
@@ -464,76 +452,6 @@ def get_candidate_by_id(candidates, place_id):
     return None
 
 
-def render_naver_api_debug(destination):
-    st.subheader("네이버 API 진단 모드")
-
-    st.write("현재 버전은 Streamlit Secrets를 먼저 읽고, 값의 앞뒤 공백을 제거합니다.")
-
-    st.write(f"OPENAI_API_KEY: {mask_secret(OPENAI_API_KEY)}")
-    st.write(f"NAVER_CLIENT_ID: {mask_secret(NAVER_CLIENT_ID)}")
-    st.write(f"NAVER_CLIENT_SECRET: {mask_secret(NAVER_CLIENT_SECRET)}")
-
-    test_query = st.text_input(
-        "네이버 API 테스트 검색어",
-        value=destination if destination else "진주",
-    )
-
-    if st.button("네이버 API 연결 테스트"):
-        raw = fetch_naver_local_raw(test_query, display=5)
-
-        st.write("요청 URL: https://openapi.naver.com/v1/search/local.json")
-        st.write(f"검색어: {test_query}")
-        st.write(f"상태 코드: {raw.get('status_code')}")
-
-        if raw["ok"]:
-            st.success("네이버 지역 검색 API 호출 성공")
-
-            data = raw["data"] or {}
-            items = data.get("items", [])
-
-            st.write(f"검색 결과 개수: {len(items)}개")
-            st.json(data)
-        else:
-            st.error("네이버 지역 검색 API 호출 실패")
-
-            error_text = raw.get("error") or raw.get("text") or "오류 내용 없음"
-            st.write(error_text)
-
-            st.info(
-                "401이면 Client ID/Secret 값이 잘못되었거나, 값에 공백/줄바꿈이 섞였을 가능성이 큽니다. "
-                "403이면 해당 애플리케이션에 검색 API 권한이 없을 가능성이 높습니다."
-            )
-
-
-def render_verified_candidates(candidates, diagnostics, used_relaxed_filter):
-    st.subheader("검증된 네이버 지역 장소 후보")
-
-    if used_relaxed_filter:
-        st.warning(
-            "엄격한 지역 필터 적용 시 후보가 없어, 지역 필터를 완화해서 후보를 가져왔습니다. "
-            "결과가 넓은 지역 기준으로 나올 수 있습니다."
-        )
-    else:
-        st.write("아래 후보는 네이버 지역 검색 API 결과를 지역 기준으로 필터링한 목록입니다.")
-
-    with st.expander("네이버 검색 진단 결과 보기"):
-        st.write("각 검색어별 API 호출 결과와 필터링 전후 후보 개수입니다.")
-        st.json(diagnostics)
-
-    if not candidates:
-        st.warning("검증된 장소 후보가 없습니다. 네이버 API 진단 모드에서 상태 코드를 확인해 주세요.")
-        return
-
-    cols = st.columns(2)
-
-    for idx, place in enumerate(candidates[:12]):
-        with cols[idx % 2]:
-            st.markdown(f"**{place['id']} · {place['title']}**")
-            st.caption(place["category"])
-            st.write(place["road_address"] or place["address"])
-            st.link_button("네이버지도에서 보기", place["map_link"])
-
-
 def render_travel_plan(plan_data, candidates):
     st.markdown("## 전체 여행 요약")
     st.write(plan_data.get("summary", ""))
@@ -547,7 +465,6 @@ def render_travel_plan(plan_data, candidates):
     st.markdown("## 날짜별 일정")
 
     daily_schedule = plan_data.get("daily_schedule", [])
-    used_place_ids = []
 
     for day in daily_schedule:
         date_text = day.get("date", "")
@@ -565,7 +482,6 @@ def render_travel_plan(plan_data, candidates):
             place = get_candidate_by_id(candidates, place_id)
 
             if place:
-                used_place_ids.append(place_id)
                 st.markdown(
                     f"- **{time_text}**: "
                     f"[{place['title']}]({place['map_link']}) - "
@@ -578,9 +494,6 @@ def render_travel_plan(plan_data, candidates):
                     f"`예상 비용: {cost}`"
                 )
 
-                if place_id:
-                    st.caption(f"검증되지 않은 장소 ID가 제외되었습니다: {place_id}")
-
     st.markdown("## 예상 상세 예산")
     st.write(plan_data.get("estimated_budget_detail", ""))
 
@@ -588,45 +501,9 @@ def render_travel_plan(plan_data, candidates):
     for food in plan_data.get("recommended_foods", []):
         st.markdown(f"- {food}")
 
-    st.markdown("## 준비물")
-    for item in plan_data.get("packing_list", []):
-        st.markdown(f"- {item}")
-
     st.markdown("## 비 올 때 대체 일정")
     for item in plan_data.get("rainy_day_alternatives", []):
         st.markdown(f"- {item}")
-
-    st.markdown("## 절약 팁")
-    for tip in plan_data.get("saving_tips", []):
-        st.markdown(f"- {tip}")
-
-    recommended_place_ids = plan_data.get("recommended_place_ids", [])
-
-    all_link_ids = []
-
-    for place_id in recommended_place_ids:
-        if place_id not in all_link_ids:
-            all_link_ids.append(place_id)
-
-    for place_id in used_place_ids:
-        if place_id not in all_link_ids:
-            all_link_ids.append(place_id)
-
-    valid_places = [
-        get_candidate_by_id(candidates, place_id)
-        for place_id in all_link_ids
-        if get_candidate_by_id(candidates, place_id)
-    ]
-
-    if valid_places:
-        st.markdown("## 추천 장소 네이버지도 링크")
-        st.write("아래 버튼을 누르면 네이버지도에서 위치, 리뷰, 메뉴, 가격 정보를 확인할 수 있습니다.")
-
-        cols = st.columns(3)
-
-        for idx, place in enumerate(valid_places):
-            with cols[idx % 3]:
-                st.link_button(place["title"], place["map_link"])
 
 
 def register_korean_pdf_fonts():
@@ -765,10 +642,6 @@ def build_travel_pdf(
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                 ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]
         )
     )
@@ -822,10 +695,6 @@ def build_travel_pdf(
                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                     ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
                 ]
             )
         )
@@ -842,29 +711,9 @@ def build_travel_pdf(
     for food in plan_data.get("recommended_foods", []):
         story.append(pdf_paragraph(f"- {food}", body_style))
 
-    story.append(pdf_paragraph("9. 준비물", h1_style))
-    for item in plan_data.get("packing_list", []):
-        story.append(pdf_paragraph(f"- {item}", body_style))
-
-    story.append(pdf_paragraph("10. 비 올 때 대체 일정", h1_style))
+    story.append(pdf_paragraph("9. 비 올 때 대체 일정", h1_style))
     for item in plan_data.get("rainy_day_alternatives", []):
         story.append(pdf_paragraph(f"- {item}", body_style))
-
-    story.append(pdf_paragraph("11. 절약 팁", h1_style))
-    for tip in plan_data.get("saving_tips", []):
-        story.append(pdf_paragraph(f"- {tip}", body_style))
-
-    recommended_place_ids = plan_data.get("recommended_place_ids", [])
-
-    if recommended_place_ids:
-        story.append(pdf_paragraph("12. 네이버지도 확인 링크", h1_style))
-        story.append(pdf_paragraph("장소명은 PDF에서도 클릭 가능한 링크로 삽입했습니다.", body_style))
-
-        for place_id in recommended_place_ids:
-            place = get_candidate_by_id(candidates, place_id)
-
-            if place:
-                story.append(pdf_place_link(place, body_style))
 
     doc.build(story)
 
@@ -905,34 +754,6 @@ else:
 budget = st.text_input("예산", placeholder="예: 35만원, 500000원")
 preference = st.text_input("여행 취향", placeholder="예: 맛집, 카페, 관광지")
 
-st.subheader("빠른 네이버지도 검색")
-
-if destination:
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.link_button(
-            "관광지 검색",
-            make_naver_map_search_link(f"{destination} 관광지"),
-        )
-
-    with col2:
-        st.link_button(
-            "맛집 검색",
-            make_naver_map_search_link(f"{destination} 맛집"),
-        )
-
-    with col3:
-        st.link_button(
-            "카페 검색",
-            make_naver_map_search_link(f"{destination} 카페"),
-        )
-else:
-    st.info("여행지를 입력하면 네이버지도 검색 버튼이 표시됩니다.")
-
-with st.expander("네이버 API 진단 모드 열기"):
-    render_naver_api_debug(destination)
-
 
 if st.button("여행 계획 생성"):
     if not OPENAI_API_KEY:
@@ -957,18 +778,16 @@ if st.button("여행 계획 생성"):
             weather_info = get_weather(destination, start_date, end_date)
             price_guide = get_korea_price_guide()
 
-            strict_candidates, strict_diagnostics = get_verified_place_candidates(
+            strict_candidates, _ = get_verified_place_candidates(
                 destination,
                 preference,
                 use_region_filter=True,
             )
 
-            used_relaxed_filter = False
             candidates = strict_candidates
-            diagnostics = strict_diagnostics
 
             if not strict_candidates:
-                relaxed_candidates, relaxed_diagnostics = get_verified_place_candidates(
+                relaxed_candidates, _ = get_verified_place_candidates(
                     destination,
                     preference,
                     use_region_filter=False,
@@ -976,11 +795,6 @@ if st.button("여행 계획 생성"):
 
                 if relaxed_candidates:
                     candidates = relaxed_candidates
-                    diagnostics = {
-                        "strict_filter": strict_diagnostics,
-                        "relaxed_filter": relaxed_diagnostics,
-                    }
-                    used_relaxed_filter = True
 
             candidates_text = format_candidates_for_prompt(candidates)
 
@@ -1007,9 +821,8 @@ if st.button("여행 계획 생성"):
             with st.expander("한국 물가 보정 기준 보기"):
                 st.text(price_guide)
 
-            render_verified_candidates(candidates, diagnostics, used_relaxed_filter)
-
             if not candidates:
+                st.warning("네이버 지역 검색 결과가 충분하지 않습니다. 여행지를 더 넓은 지역명으로 입력해 보세요.")
                 st.stop()
 
             prompt = f"""
@@ -1046,10 +859,10 @@ if st.button("여행 계획 생성"):
             - 장소는 반드시 위의 검증된 후보 목록에 있는 place_id만 사용해.
             - 새로운 장소명, 임의 업체명, 과거에 있었던 브랜드명, 존재 여부가 불확실한 장소명은 절대 만들지 마.
             - place_id는 반드시 P001, P002 같은 형식으로 후보 목록에 존재하는 값만 사용해.
-            - recommended_place_ids도 반드시 후보 목록의 place_id만 사용해.
             - 후보 목록에 없는 장소는 절대 사용하지 마.
             - 음식 가격을 지나치게 낮게 잡지 마.
             - 한국 물가 보정 기준을 반드시 반영해.
+            - 준비물과 절약 팁 항목은 작성하지 마.
 
             반드시 아래 JSON 형식으로만 답변해줘.
             마크다운 문법은 사용하지 말고, JSON 이외의 설명도 쓰지 마.
@@ -1074,10 +887,7 @@ if st.button("여행 계획 생성"):
               ],
               "estimated_budget_detail": "상세 예산 설명",
               "recommended_foods": ["추천 음식 1", "추천 음식 2"],
-              "packing_list": ["준비물 1", "준비물 2"],
-              "rainy_day_alternatives": ["우천 시 대체 일정 1", "우천 시 대체 일정 2"],
-              "saving_tips": ["절약 팁 1", "절약 팁 2"],
-              "recommended_place_ids": ["P001", "P002", "P003"]
+              "rainy_day_alternatives": ["우천 시 대체 일정 1", "우천 시 대체 일정 2"]
             }}
 
             조건:
@@ -1129,27 +939,6 @@ if st.button("여행 계획 생성"):
                         file_name=f"{destination.replace(' ', '_')}_travel_plan.pdf",
                         mime="application/pdf",
                     )
-
-                    st.subheader("추가 네이버지도 검색")
-                    col4, col5, col6 = st.columns(3)
-
-                    with col4:
-                        st.link_button(
-                            "숙소 검색",
-                            make_naver_map_search_link(f"{destination} 숙소"),
-                        )
-
-                    with col5:
-                        st.link_button(
-                            "대중교통 검색",
-                            make_naver_map_search_link(f"{destination} 대중교통"),
-                        )
-
-                    with col6:
-                        st.link_button(
-                            "실내 관광지 검색",
-                            make_naver_map_search_link(f"{destination} 실내 관광지"),
-                        )
 
                 except json.JSONDecodeError:
                     st.error("AI 응답을 처리하는 중 오류가 발생했습니다. 다시 시도해 주세요.")
