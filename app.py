@@ -1020,9 +1020,6 @@ def render_travel_plan(plan_data, candidates, budget_plan, destination):
                 st.divider()
                 render_day_route_links(day, candidates, destination)
 
-                st.divider()
-                render_day_route_links(day, candidates, destination)
-
     render_extra_place_recommendations(plan_data, candidates)
 
     render_budget_breakdown_cards(budget_plan)
